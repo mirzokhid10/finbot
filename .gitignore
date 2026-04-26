@@ -1,0 +1,38 @@
+# ======================
+# Laravel
+# ======================
+/findash/vendor/
+/findash/node_modules/
+/findash/public/storage
+/findash/storage/*.key
+/findash/bootstrap/cache/*.php
+
+# Laravel env
+/findash/.env
+
+# ======================
+# Python
+# ======================
+/findashbot/__pycache__/
+/findashbot/*.pyc
+/findashbot/venv/
+/findashbot/.env
+
+# ======================
+# Global env files
+# ======================
+.env
+*.env
+
+# ======================
+# OS / Editor
+# ======================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ======================
+# Logs
+# ======================
+*.log
