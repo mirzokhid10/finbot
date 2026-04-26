@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import asyncio
 import logging
@@ -34,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_main_menu():
+    """Main menu keyboard"""
     kb = [
         [KeyboardButton(text="➕ Add Transaction")],
         [KeyboardButton(text="📊 Summary"), KeyboardButton(text="🗑 Delete Last")],
@@ -42,7 +45,7 @@ def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-# ===== CALLBACK QUERY HANDLERS =====
+# ==================== CALLBACK QUERY HANDLERS ====================
 
 @dp.callback_query(F.data.startswith("edit_tx:"))
 async def handle_edit_transaction(callback: CallbackQuery, state: FSMContext):
@@ -94,7 +97,6 @@ async def handle_create_custom_category_callback(callback: CallbackQuery, state:
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == str(callback.from_user.id)).first()
 
-        # Create category
         cat_type = pending.get('type', 'expense')
         new_cat = Category(
             user_id=user.id,
@@ -107,7 +109,6 @@ async def handle_create_custom_category_callback(callback: CallbackQuery, state:
 
         await callback.message.edit_text(f"✅ Created category: **{category_name.title()}**", parse_mode="Markdown")
 
-        # Save transaction
         pending['category'] = category_name.title()
         from transaction.transaction import save_transaction_with_confirmation
         await save_transaction_with_confirmation(callback.message, pending, user)
@@ -156,15 +157,12 @@ async def handle_cancel_edit(callback: CallbackQuery):
     await callback.answer()
 
 
-# ===== EXISTING HANDLERS =====
+# ==================== MESSAGE HANDLERS ====================
 
-@dp.message(F.voice)
-async def voice_handler(message: types.Message, state: FSMContext):
-    await handle_voice_command(message, bot, state)
-
-
+# 1. Commands
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    """Handle /start command"""
     user_data = message.from_user.model_dump()
     msg, is_new = await register_user_if_not_exists(user_data)
 
@@ -197,8 +195,22 @@ async def cmd_start(message: types.Message):
         await message.answer(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
 
+@dp.message(Command("categories"))
+async def cmd_categories(message: types.Message):
+    """Handle /categories command"""
+    await list_categories(message)
+
+
+@dp.message(Command("addcategory"))
+async def cmd_add_category(message: types.Message, state: FSMContext):
+    """Handle /addcategory command"""
+    await start_add_category(message, state)
+
+
+# 2. Contact
 @dp.message(F.contact)
 async def handle_contact(message: types.Message):
+    """Handle phone number sharing"""
     telegram_id = str(message.from_user.id)
     phone_number = message.contact.phone_number
 
@@ -225,35 +237,48 @@ async def handle_contact(message: types.Message):
         db.close()
 
 
-# FSM Handlers
+# 3. Voice
+@dp.message(F.voice)
+async def voice_handler(message: types.Message, state: FSMContext):
+    """Handle voice messages"""
+    await handle_voice_command(message, bot, state)
+
+
+# 4. FSM State Handlers
 @dp.message(TransactionFlow.waiting_for_custom_category_name)
 async def custom_category_name_handler(message: types.Message, state: FSMContext):
+    """Handle custom category name input"""
     await handle_custom_category_name(message, state)
 
 
 @dp.message(TransactionFlow.waiting_for_custom_category_type)
 async def custom_category_type_handler(message: types.Message, state: FSMContext):
+    """Handle custom category type selection"""
     await handle_custom_category_type(message, state)
 
 
 @dp.message(TransactionFlow.waiting_for_missing_info)
 async def missing_info_handler(message: types.Message, state: FSMContext):
+    """Handle missing information input"""
     await handle_missing_info_logic(message, state)
 
 
 @dp.message(CategoryFlow.waiting_for_category_name)
 async def category_name_handler(message: types.Message, state: FSMContext):
+    """Handle category name input from /addcategory"""
     await receive_category_name(message, state)
 
 
 @dp.message(CategoryFlow.waiting_for_category_type)
 async def category_type_handler(message: types.Message, state: FSMContext):
+    """Handle category type selection from /addcategory"""
     await receive_category_type(message, state)
 
 
-# Button Handlers
+# 5. Button Handlers
 @dp.message(F.text == "➕ Add Transaction")
 async def add_transaction_btn(message: types.Message):
+    """Handle Add Transaction button"""
     await message.answer(
         "🎤 **Ready to record.**\n\n"
         "Please send a **voice message** describing the transaction.\n"
@@ -264,6 +289,7 @@ async def add_transaction_btn(message: types.Message):
 
 @dp.message(F.text == "📊 Summary")
 async def summary_btn(message: types.Message):
+    """Handle Summary button"""
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == str(message.from_user.id)).first()
         if not user:
@@ -281,6 +307,7 @@ async def summary_btn(message: types.Message):
 
 @dp.message(F.text == "🗑 Delete Last")
 async def delete_btn_handler(message: types.Message):
+    """Handle Delete Last button"""
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == str(message.from_user.id)).first()
         await process_deletion(message, user)
@@ -288,22 +315,16 @@ async def delete_btn_handler(message: types.Message):
 
 @dp.message(F.text == "📂 Categories")
 async def categories_btn_handler(message: types.Message):
+    """Handle Categories button"""
     await list_categories(message)
 
 
-@dp.message(Command("categories"))
-async def cmd_categories(message: types.Message):
-    await list_categories(message)
-
-
-@dp.message(Command("addcategory"))
-async def cmd_add_category(message: types.Message, state: FSMContext):
-    await start_add_category(message, state)
-
-
-# Text Fallback (MUST BE LAST)
+# 6. Text Fallback (MUST BE LAST)
 @dp.message(F.text)
-async def text_handler(message: types.Message):
+async def text_handler(message: types.Message, state: FSMContext):
+    """Handle any text message as transaction input"""
+
+    # Skip button texts (already handled above)
     if message.text in ["➕ Add Transaction", "📊 Summary", "🗑 Delete Last", "📂 Categories"]:
         return
 
@@ -318,17 +339,19 @@ async def text_handler(message: types.Message):
 
     from services.ai_service import extract_intent
     data = await extract_intent(message.text, cat_names)
+    data['available_categories'] = cat_names
 
     intent = data.get('intent')
     if intent == "log_transaction":
         from transaction.transaction import process_logging
-        from aiogram.fsm.context import FSMContext
-        await process_logging(message, data, user, cat_names, None)
+        await process_logging(message, data, user, cat_names, state)
     elif intent == "query":
         from transaction.transaction import process_query
         await process_query(message, data, user)
     elif intent == "delete_last":
         await process_deletion(message, user)
+    elif intent == "correct_last":
+        await start_correction(message, user, state)
     else:
         await message.answer(
             f"💭 I understood: '{message.text}'\n\n"
@@ -339,8 +362,14 @@ async def text_handler(message: types.Message):
         )
 
 
+# ==================== MAIN ====================
+
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    """Start the bot"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     logger.info("🚀 Bot is starting...")
     try:
         await dp.start_polling(bot)

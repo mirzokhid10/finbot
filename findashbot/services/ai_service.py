@@ -2,7 +2,7 @@
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from groq import AsyncGroq
 
 client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
@@ -54,6 +54,7 @@ async def extract_intent(text, categories_list):
     "50,000 received today" -> {{"intent": "log_transaction", "type": "income", "amount": 50000, "category": null, "confidence": "medium", "missing_fields": ["category"]}}
     "Spent something on logistics" -> {{"intent": "log_transaction", "type": "expense", "amount": null, "category": "Logistics", "confidence": "low", "missing_fields": ["amount"]}}
     "Edit the last transaction" -> {{"intent": "correct_last"}}
+    "How much did we earn this week?" -> {{"intent": "query", "query_target": "How much did we earn this week?"}}
     """
 
     response = await client.chat.completions.create(
@@ -93,7 +94,7 @@ async def generate_confirmation_message(transaction_data):
         date_obj = datetime.strptime(date, '%Y-%m-%d')
         if date_obj.date() == datetime.now().date():
             date_display = "today"
-        elif date_obj.date() == (datetime.now().date() - datetime.timedelta(days=1)):
+        elif date_obj.date() == (datetime.now().date() - timedelta(days=1)):
             date_display = "yesterday"
         else:
             date_display = f"on {date_obj.strftime('%B %d')}"
@@ -103,7 +104,7 @@ async def generate_confirmation_message(transaction_data):
     # Build natural message
     emoji = "💰" if tx_type == "income" else "💸"
 
-    msg = f"{emoji} Got it!\n\n"
+    msg = f"{emoji} **Got it!**\n\n"
     msg += f"**{amount} som** {tx_type} {date_display}\n"
     msg += f"📂 Category: {category}\n"
 
@@ -128,10 +129,10 @@ async def generate_clarification_question(data, missing_fields):
     if "category" in missing_fields:
         categories_list = data.get('available_categories', [])
         if categories_list:
-            income_cats = [c for c in categories_list if
-                           'income' in c.lower() or c in ['Sales', 'Salary', 'Investment']]
+            income_cats = [c for c in categories_list if c in ['Sales', 'Salary', 'Investment', 'Other Income']]
             expense_cats = [c for c in categories_list if
-                            'expense' in c.lower() or c in ['Logistics', 'Rent', 'Utilities', 'Marketing', 'Salaries']]
+                            c in ['Logistics', 'Rent', 'Utilities', 'Marketing', 'Salaries', 'Office Supplies',
+                                  'Other Expense']]
 
             relevant_cats = income_cats if data.get('type') == 'income' else expense_cats
 

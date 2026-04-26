@@ -1,5 +1,8 @@
+# transaction/transaction.py
+
 import os
 import logging
+import re
 from datetime import datetime, timedelta
 from sqlalchemy import func
 from aiogram import Bot, types
@@ -18,11 +21,13 @@ from services.ai_service import (
 
 logger = logging.getLogger(__name__)
 
+# Memory to store last transaction for each user
 user_mem = {}
 
 
 class TransactionFlow(StatesGroup):
     waiting_for_missing_info = State()
+    waiting_for_correction = State()
     waiting_for_custom_category_name = State()
     waiting_for_custom_category_type = State()
 
@@ -33,6 +38,7 @@ async def handle_voice_command(message: types.Message, bot: Bot, state: FSMConte
     processing_msg = await message.answer("🎧 Processing your voice message...")
 
     try:
+        # 1. Download & Transcribe
         file_id = message.voice.file_id
         file = await bot.get_file(file_id)
         file_path = f"voice_{file_id}.ogg"
@@ -41,9 +47,13 @@ async def handle_voice_command(message: types.Message, bot: Bot, state: FSMConte
         text = await transcribe_voice(file_path)
         os.remove(file_path)
 
+        # Delete processing message
         await processing_msg.delete()
+
+        # Show what was heard
         await message.answer(f"_I heard: \"{text}\"_", parse_mode="Markdown")
 
+        # 2. Get DB Context
         with SessionLocal() as db:
             user = db.query(User).filter(User.telegram_id == str(message.from_user.id)).first()
             if not user:
@@ -53,9 +63,11 @@ async def handle_voice_command(message: types.Message, bot: Bot, state: FSMConte
             categories = db.query(Category).filter(Category.user_id == user.id).all()
             cat_names = [c.name for c in categories]
 
+            # 3. AI Extraction
             data = await extract_intent(text, cat_names)
             data['available_categories'] = cat_names
 
+            # 4. Route Intent
             intent = data.get('intent')
 
             if intent == "log_transaction":
@@ -99,7 +111,7 @@ async def process_logging(message, data, user, cat_names, state):
             "Please tell me: _How much was it?_",
             parse_mode="Markdown"
         )
-        await state.update_data(pending=data)
+        await state.update_data(pending=data, waiting_for='amount')
         await state.set_state(TransactionFlow.waiting_for_missing_info)
         return
 
@@ -315,329 +327,10 @@ async def save_transaction_with_confirmation(message, data, user, use_others=Fal
             ]
         ])
 
+        from main import get_main_menu
         await message.answer(confirmation, reply_markup=kb, parse_mode="Markdown")
-
-
-async def save_transaction(message, data, user):
-    """Save transaction to database with natural confirmation"""
-
-    with SessionLocal() as db:
-        # Find or create category
-        category_name = data.get('category', '').strip()
-        cat = None
-
-        if category_name:
-            # Try exact match
-            cat = db.query(Category).filter(
-                Category.user_id == user.id,
-                func.lower(Category.name) == func.lower(category_name)
-            ).first()
-
-            # Try partial match
-            if not cat:
-                cat = db.query(Category).filter(
-                    Category.user_id == user.id,
-                    Category.name.ilike(f"%{category_name}%")
-                ).first()
-
-        # Use or create "Others" if no category
-        if not cat:
-            tx_type = data['type']
-            cat = db.query(Category).filter(
-                Category.user_id == user.id,
-                func.lower(Category.name) == 'others',
-                Category.type == tx_type
-            ).first()
-
-            if not cat:
-                cat = Category(
-                    user_id=user.id,
-                    name="Others",
-                    type=tx_type,
-                    is_custom=False
-                )
-                db.add(cat)
-                db.commit()
-                db.refresh(cat)
-
-        # Create transaction
-        new_tx = Transaction(
-            user_id=user.id,
-            amount=data['amount'],
-            type=data['type'],
-            category_id=cat.id,
-            date=datetime.strptime(data['date'], '%Y-%m-%d').date(),
-            note=data.get('note', ''),
-            created_at=datetime.now(),
-            updated_at=datetime.now()
-        )
-        db.add(new_tx)
-        db.commit()
-        db.refresh(new_tx)
-
-        user_mem[user.id] = new_tx.id
-
-        # Generate natural confirmation
-        data['category'] = cat.name
-        confirmation = await generate_confirmation_message(data)
-
-        # Import here to avoid circular import
-        from aiogram.types import ReplyKeyboardRemove
-        await message.answer(confirmation, reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
-
-
-async def process_query(message, data, user):
-    """Handle financial queries with intelligent data analysis"""
-
-    query_target = data.get('query_target', '').lower()
-    original_text = message.text.lower() if message.text else query_target
-
-    with SessionLocal() as db:
-        # ===== 1. DETERMINE TIME PERIOD =====
-        now = datetime.now()
-        start_date = None
-        end_date = None
-        period_name = "all time"
-
-        # Today
-        if any(word in original_text for word in ["today", "сегодня"]):
-            start_date = now.date()
-            end_date = now.date()
-            period_name = "today"
-
-        # Yesterday
-        elif any(word in original_text for word in ["yesterday", "вчера"]):
-            start_date = (now - timedelta(days=1)).date()
-            end_date = (now - timedelta(days=1)).date()
-            period_name = "yesterday"
-
-        # This week
-        elif any(word in original_text for word in ["this week", "эта неделя", "week"]):
-            start_date = (now - timedelta(days=now.weekday())).date()
-            end_date = now.date()
-            period_name = "this week"
-
-        # Last week
-        elif any(word in original_text for word in ["last week", "прошлая неделя"]):
-            start_of_last_week = (now - timedelta(days=now.weekday() + 7)).date()
-            end_of_last_week = (now - timedelta(days=now.weekday() + 1)).date()
-            start_date = start_of_last_week
-            end_date = end_of_last_week
-            period_name = "last week"
-
-        # This month
-        elif any(word in original_text for word in ["this month", "этот месяц", "month"]):
-            start_date = now.replace(day=1).date()
-            end_date = now.date()
-            period_name = "this month"
-
-        # Last month
-        elif any(word in original_text for word in ["last month", "прошлый месяц"]):
-            first_of_this_month = now.replace(day=1).date()
-            last_month = first_of_this_month - timedelta(days=1)
-            start_date = last_month.replace(day=1)
-            end_date = last_month
-            period_name = "last month"
-
-        # This year
-        elif any(word in original_text for word in ["this year", "этот год", "year"]):
-            start_date = now.replace(month=1, day=1).date()
-            end_date = now.date()
-            period_name = "this year"
-
-        # Last 7/30/90 days
-        days_match = None
-        import re
-        days_pattern = re.search(r'last (\d+) days?', original_text)
-        if days_pattern:
-            days_count = int(days_pattern.group(1))
-            start_date = (now - timedelta(days=days_count)).date()
-            end_date = now.date()
-            period_name = f"last {days_count} days"
-
-        # ===== 2. BUILD BASE QUERY =====
-        query = db.query(Transaction).filter(Transaction.user_id == user.id)
-
-        if start_date:
-            query = query.filter(Transaction.date >= start_date)
-        if end_date:
-            query = query.filter(Transaction.date <= end_date)
-
-        # ===== 3. DETERMINE TRANSACTION TYPE =====
-        tx_type = None
-        metric = "transactions"
-
-        # Income keywords
-        if any(word in original_text for word in [
-            "earn", "earned", "income", "revenue", "received", "made",
-            "заработали", "доход", "получили"
-        ]):
-            query = query.filter(Transaction.type == 'income')
-            tx_type = 'income'
-            metric = "earned"
-
-        # Expense keywords
-        elif any(word in original_text for word in [
-            "spend", "spent", "expense", "paid", "cost",
-            "потратили", "расход", "затраты"
-        ]):
-            query = query.filter(Transaction.type == 'expense')
-            tx_type = 'expense'
-            metric = "spent"
-
-        # ===== 4. CHECK FOR CATEGORY FILTER =====
-        categories = db.query(Category).filter(Category.user_id == user.id).all()
-        matched_category = None
-
-        for cat in categories:
-            # Check if category name is mentioned
-            if cat.name.lower() in original_text:
-                query = query.filter(Transaction.category_id == cat.id)
-                matched_category = cat.name
-                break
-
-        # ===== 5. EXECUTE QUERY & CALCULATE =====
-        transactions = query.order_by(Transaction.date.desc()).all()
-
-        if not transactions:
-            # No data found
-            filters = []
-            if matched_category:
-                filters.append(f"category '{matched_category}'")
-            if tx_type:
-                filters.append(tx_type)
-            if period_name != "all time":
-                filters.append(period_name)
-
-            filter_text = " for " + ", ".join(filters) if filters else ""
-
-            await message.answer(
-                f"📊 **No Data Found**\n\n"
-                f"I couldn't find any transactions{filter_text}.",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Calculate totals
-        total_amount = sum(t.amount for t in transactions)
-        count = len(transactions)
-
-        # Get category breakdown if no specific category was requested
-        category_breakdown = {}
-        if not matched_category:
-            for tx in transactions:
-                cat_name = tx.category.name if tx.category else "Uncategorized"
-                category_breakdown[cat_name] = category_breakdown.get(cat_name, 0) + tx.amount
-
-        # ===== 6. FORMAT RESPONSE =====
-
-        # Choose emoji
-        if tx_type == 'income':
-            emoji = "💰"
-            action = "earned"
-        elif tx_type == 'expense':
-            emoji = "💸"
-            action = "spent"
-        else:
-            emoji = "📊"
-            action = "total"
-
-        # Build response
-        response = f"{emoji} **Financial Report**\n\n"
-
-        # Main stat
-        if matched_category:
-            response += f"**{matched_category}:** {total_amount:,.0f} som\n"
-        else:
-            response += f"**Total {action}:** {total_amount:,.0f} som\n"
-
-        response += f"📅 Period: {period_name.title()}\n"
-        response += f"🧾 Transactions: {count}\n"
-
-        # Category breakdown (top 5)
-        if category_breakdown and len(category_breakdown) > 1:
-            response += f"\n**Breakdown by Category:**\n"
-            sorted_cats = sorted(category_breakdown.items(), key=lambda x: x[1], reverse=True)
-            for i, (cat_name, amount) in enumerate(sorted_cats[:5], 1):
-                percentage = (amount / total_amount * 100) if total_amount > 0 else 0
-                response += f"{i}. {cat_name}: {amount:,.0f} som ({percentage:.1f}%)\n"
-
-            if len(sorted_cats) > 5:
-                response += f"_...and {len(sorted_cats) - 5} more categories_\n"
-
-        # Average per transaction
-        avg = total_amount / count if count > 0 else 0
-        response += f"\n📈 Average: {avg:,.0f} som per transaction"
-
-        # Comparison with previous period (if applicable)
-        if period_name in ["this week", "this month", "this year"]:
-            prev_total = await get_previous_period_total(db, user.id, period_name, tx_type, matched_category)
-            if prev_total is not None and prev_total > 0:
-                change = total_amount - prev_total
-                change_pct = (change / prev_total * 100) if prev_total > 0 else 0
-
-                if change > 0:
-                    trend = "📈" if tx_type == 'income' else "⚠️"
-                    change_text = f"+{change:,.0f}"
-                elif change < 0:
-                    trend = "⚠️" if tx_type == 'income' else "📉"
-                    change_text = f"{change:,.0f}"
-                else:
-                    trend = "➡️"
-                    change_text = "No change"
-
-                response += f"\n\n{trend} vs previous period: {change_text} som ({change_pct:+.1f}%)"
-
-        await message.answer(response, parse_mode="Markdown")
-
-
-async def get_previous_period_total(db, user_id, period_name, tx_type, category_name):
-    """Calculate total for previous period for comparison"""
-
-    now = datetime.now()
-    start_date = None
-    end_date = None
-
-    if period_name == "this week":
-        # Previous week
-        start_date = (now - timedelta(days=now.weekday() + 7)).date()
-        end_date = (now - timedelta(days=now.weekday() + 1)).date()
-
-    elif period_name == "this month":
-        # Previous month
-        first_of_this_month = now.replace(day=1).date()
-        last_month = first_of_this_month - timedelta(days=1)
-        start_date = last_month.replace(day=1)
-        end_date = last_month
-
-    elif period_name == "this year":
-        # Previous year
-        start_date = now.replace(year=now.year - 1, month=1, day=1).date()
-        end_date = now.replace(year=now.year - 1, month=12, day=31).date()
-
-    if not start_date:
-        return None
-
-    # Build query
-    query = db.query(func.sum(Transaction.amount)).filter(
-        Transaction.user_id == user_id,
-        Transaction.date >= start_date,
-        Transaction.date <= end_date
-    )
-
-    if tx_type:
-        query = query.filter(Transaction.type == tx_type)
-
-    if category_name:
-        cat = db.query(Category).filter(
-            Category.user_id == user_id,
-            func.lower(Category.name) == func.lower(category_name)
-        ).first()
-        if cat:
-            query = query.filter(Transaction.category_id == cat.id)
-
-    result = query.scalar()
-    return result or 0
+        # Send main menu in separate message
+        await message.answer("What's next?", reply_markup=get_main_menu())
 
 
 async def start_correction(message, user, state):
@@ -718,6 +411,252 @@ async def process_deletion(message, user):
             await message.answer("❌ Transaction not found")
 
 
+async def process_query(message, data, user):
+    """Handle financial queries with intelligent data analysis"""
+
+    query_target = data.get('query_target', '').lower()
+    original_text = message.text.lower() if message.text else query_target
+
+    with SessionLocal() as db:
+        # ===== 1. DETERMINE TIME PERIOD =====
+        now = datetime.now()
+        start_date = None
+        end_date = None
+        period_name = "all time"
+
+        # Today
+        if any(word in original_text for word in ["today", "сегодня"]):
+            start_date = now.date()
+            end_date = now.date()
+            period_name = "today"
+
+        # Yesterday
+        elif any(word in original_text for word in ["yesterday", "вчера"]):
+            start_date = (now - timedelta(days=1)).date()
+            end_date = (now - timedelta(days=1)).date()
+            period_name = "yesterday"
+
+        # This week
+        elif any(word in original_text for word in ["this week", "эта неделя", "week"]):
+            start_date = (now - timedelta(days=now.weekday())).date()
+            end_date = now.date()
+            period_name = "this week"
+
+        # Last week
+        elif any(word in original_text for word in ["last week", "прошлая неделя"]):
+            start_of_last_week = (now - timedelta(days=now.weekday() + 7)).date()
+            end_of_last_week = (now - timedelta(days=now.weekday() + 1)).date()
+            start_date = start_of_last_week
+            end_date = end_of_last_week
+            period_name = "last week"
+
+        # This month
+        elif any(word in original_text for word in ["this month", "этот месяц", "month"]):
+            start_date = now.replace(day=1).date()
+            end_date = now.date()
+            period_name = "this month"
+
+        # Last month
+        elif any(word in original_text for word in ["last month", "прошлый месяц"]):
+            first_of_this_month = now.replace(day=1).date()
+            last_month = first_of_this_month - timedelta(days=1)
+            start_date = last_month.replace(day=1)
+            end_date = last_month
+            period_name = "last month"
+
+        # This year
+        elif any(word in original_text for word in ["this year", "этот год", "year"]):
+            start_date = now.replace(month=1, day=1).date()
+            end_date = now.date()
+            period_name = "this year"
+
+        # Last N days
+        days_pattern = re.search(r'last (\d+) days?', original_text)
+        if days_pattern:
+            days_count = int(days_pattern.group(1))
+            start_date = (now - timedelta(days=days_count)).date()
+            end_date = now.date()
+            period_name = f"last {days_count} days"
+
+        # ===== 2. BUILD BASE QUERY =====
+        query = db.query(Transaction).filter(Transaction.user_id == user.id)
+
+        if start_date:
+            query = query.filter(Transaction.date >= start_date)
+        if end_date:
+            query = query.filter(Transaction.date <= end_date)
+
+        # ===== 3. DETERMINE TRANSACTION TYPE =====
+        tx_type = None
+        metric = "transactions"
+
+        # Income keywords
+        if any(word in original_text for word in [
+            "earn", "earned", "income", "revenue", "received", "made",
+            "заработали", "доход", "получили"
+        ]):
+            query = query.filter(Transaction.type == 'income')
+            tx_type = 'income'
+            metric = "earned"
+
+        # Expense keywords
+        elif any(word in original_text for word in [
+            "spend", "spent", "expense", "paid", "cost",
+            "потратили", "расход", "затраты"
+        ]):
+            query = query.filter(Transaction.type == 'expense')
+            tx_type = 'expense'
+            metric = "spent"
+
+        # ===== 4. CHECK FOR CATEGORY FILTER =====
+        categories = db.query(Category).filter(Category.user_id == user.id).all()
+        matched_category = None
+
+        for cat in categories:
+            if cat.name.lower() in original_text:
+                query = query.filter(Transaction.category_id == cat.id)
+                matched_category = cat.name
+                break
+
+        # ===== 5. EXECUTE QUERY & CALCULATE =====
+        transactions = query.order_by(Transaction.date.desc()).all()
+
+        if not transactions:
+            filters = []
+            if matched_category:
+                filters.append(f"category '{matched_category}'")
+            if tx_type:
+                filters.append(tx_type)
+            if period_name != "all time":
+                filters.append(period_name)
+
+            filter_text = " for " + ", ".join(filters) if filters else ""
+
+            await message.answer(
+                f"📊 **No Data Found**\n\n"
+                f"I couldn't find any transactions{filter_text}.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Calculate totals
+        total_amount = sum(t.amount for t in transactions)
+        count = len(transactions)
+
+        # Get category breakdown if no specific category was requested
+        category_breakdown = {}
+        if not matched_category:
+            for tx in transactions:
+                cat_name = tx.category.name if tx.category else "Uncategorized"
+                category_breakdown[cat_name] = category_breakdown.get(cat_name, 0) + tx.amount
+
+        # ===== 6. FORMAT RESPONSE =====
+
+        # Choose emoji
+        if tx_type == 'income':
+            emoji = "💰"
+            action = "earned"
+        elif tx_type == 'expense':
+            emoji = "💸"
+            action = "spent"
+        else:
+            emoji = "📊"
+            action = "total"
+
+        # Build response
+        response = f"{emoji} **Financial Report**\n\n"
+
+        # Main stat
+        if matched_category:
+            response += f"**{matched_category}:** {total_amount:,.0f} som\n"
+        else:
+            response += f"**Total {action}:** {total_amount:,.0f} som\n"
+
+        response += f"📅 Period: {period_name.title()}\n"
+        response += f"🧾 Transactions: {count}\n"
+
+        # Category breakdown (top 5)
+        if category_breakdown and len(category_breakdown) > 1:
+            response += f"\n**Breakdown by Category:**\n"
+            sorted_cats = sorted(category_breakdown.items(), key=lambda x: x[1], reverse=True)
+            for i, (cat_name, amount) in enumerate(sorted_cats[:5], 1):
+                percentage = (amount / total_amount * 100) if total_amount > 0 else 0
+                response += f"{i}. {cat_name}: {amount:,.0f} som ({percentage:.1f}%)\n"
+
+            if len(sorted_cats) > 5:
+                response += f"_...and {len(sorted_cats) - 5} more categories_\n"
+
+        # Average per transaction
+        avg = total_amount / count if count > 0 else 0
+        response += f"\n📈 Average: {avg:,.0f} som per transaction"
+
+        # Comparison with previous period
+        if period_name in ["this week", "this month", "this year"]:
+            prev_total = await get_previous_period_total(db, user.id, period_name, tx_type, matched_category)
+            if prev_total is not None and prev_total > 0:
+                change = total_amount - prev_total
+                change_pct = (change / prev_total * 100) if prev_total > 0 else 0
+
+                if change > 0:
+                    trend = "📈" if tx_type == 'income' else "⚠️"
+                    change_text = f"+{change:,.0f}"
+                elif change < 0:
+                    trend = "⚠️" if tx_type == 'income' else "📉"
+                    change_text = f"{change:,.0f}"
+                else:
+                    trend = "➡️"
+                    change_text = "No change"
+
+                response += f"\n\n{trend} vs previous period: {change_text} som ({change_pct:+.1f}%)"
+
+        await message.answer(response, parse_mode="Markdown")
+
+
+async def get_previous_period_total(db, user_id, period_name, tx_type, category_name):
+    """Calculate total for previous period for comparison"""
+
+    now = datetime.now()
+    start_date = None
+    end_date = None
+
+    if period_name == "this week":
+        start_date = (now - timedelta(days=now.weekday() + 7)).date()
+        end_date = (now - timedelta(days=now.weekday() + 1)).date()
+
+    elif period_name == "this month":
+        first_of_this_month = now.replace(day=1).date()
+        last_month = first_of_this_month - timedelta(days=1)
+        start_date = last_month.replace(day=1)
+        end_date = last_month
+
+    elif period_name == "this year":
+        start_date = now.replace(year=now.year - 1, month=1, day=1).date()
+        end_date = now.replace(year=now.year - 1, month=12, day=31).date()
+
+    if not start_date:
+        return None
+
+    query = db.query(func.sum(Transaction.amount)).filter(
+        Transaction.user_id == user_id,
+        Transaction.date >= start_date,
+        Transaction.date <= end_date
+    )
+
+    if tx_type:
+        query = query.filter(Transaction.type == tx_type)
+
+    if category_name:
+        cat = db.query(Category).filter(
+            Category.user_id == user_id,
+            func.lower(Category.name) == func.lower(category_name)
+        ).first()
+        if cat:
+            query = query.filter(Transaction.category_id == cat.id)
+
+    result = query.scalar()
+    return result or 0
+
+
 async def handle_missing_info_logic(message: types.Message, state: FSMContext):
     """Handle follow-up responses when info was missing"""
 
@@ -745,7 +684,6 @@ async def handle_missing_info_logic(message: types.Message, state: FSMContext):
                 await message.answer("💭 Please choose 'Income' or 'Expense'")
                 return
 
-            # Now ask for category
             await ask_for_category_selection(message, pending, user, state)
             return
 
@@ -766,7 +704,6 @@ async def handle_missing_info_logic(message: types.Message, state: FSMContext):
                 await state.set_state(TransactionFlow.waiting_for_custom_category_name)
                 return
 
-            # Check if it's an existing category
             cat = db.query(Category).filter(
                 Category.user_id == user.id,
                 func.lower(Category.name) == func.lower(user_input)
@@ -783,17 +720,34 @@ async def handle_missing_info_logic(message: types.Message, state: FSMContext):
 
         # Handle amount input
         if waiting_for == 'amount':
-            import re
             amount_match = re.search(r'(\d+[\d,]*)', user_input)
             if amount_match:
                 pending['amount'] = int(amount_match.group(1).replace(',', ''))
-                await save_transaction_with_confirmation(message, pending, user)
-                await state.clear()
+
+                # Check if we now have all needed info
+                if pending.get('type'):
+                    await save_transaction_with_confirmation(message, pending, user)
+                    await state.clear()
+                else:
+                    # Still need type
+                    kb = ReplyKeyboardMarkup(
+                        keyboard=[
+                            [KeyboardButton(text="💰 Income"), KeyboardButton(text="💸 Expense")]
+                        ],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
+                    await message.answer(
+                        f"💭 Got it: **{pending['amount']:,} som**\n\n"
+                        f"Is this Income or Expense?",
+                        reply_markup=kb,
+                        parse_mode="Markdown"
+                    )
+                    await state.update_data(pending=pending, waiting_for='type')
             else:
                 await message.answer("💭 Please send me just the number.")
             return
 
-    # Fallback
     await message.answer("💭 I'm still missing some information. Please tell me the full transaction again.")
     await state.clear()
 
@@ -809,7 +763,6 @@ async def handle_custom_category_name(message: types.Message, state: FSMContext)
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == str(message.from_user.id)).first()
 
-        # Check if category already exists
         existing = db.query(Category).filter(
             Category.user_id == user.id,
             func.lower(Category.name) == func.lower(category_name)
@@ -822,7 +775,6 @@ async def handle_custom_category_name(message: types.Message, state: FSMContext)
             await state.clear()
             return
 
-        # Ask for type
         kb = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="💰 Income Category"), KeyboardButton(text="💸 Expense Category")]
@@ -849,7 +801,6 @@ async def handle_custom_category_type(message: types.Message, state: FSMContext)
     category_name = data.get('custom_category_name')
     pending = data.get('pending_transaction')
 
-    # Determine type
     if "income" in message.text.lower():
         cat_type = "income"
     elif "expense" in message.text.lower():
@@ -861,7 +812,6 @@ async def handle_custom_category_type(message: types.Message, state: FSMContext)
     with SessionLocal() as db:
         user = db.query(User).filter(User.telegram_id == str(message.from_user.id)).first()
 
-        # Create category
         new_cat = Category(
             user_id=user.id,
             name=category_name,
@@ -874,7 +824,6 @@ async def handle_custom_category_type(message: types.Message, state: FSMContext)
 
         await message.answer(f"✅ Created new category: **{category_name}** ({cat_type})", parse_mode="Markdown")
 
-        # Save transaction with new category
         pending['category'] = category_name
         await save_transaction_with_confirmation(message, pending, user)
         await state.clear()
